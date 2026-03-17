@@ -1,0 +1,503 @@
+# ============================================================
+# Sistema de Planificación de la Producción (MRP)
+# TecnoMecánica ITBA S.A.
+# ============================================================
+
+# ============================================================
+# CLASE BASE: ElementoProduccion
+# ============================================================
+class ElementoProduccion:
+    """Clase base para todo elemento que contribuye a un producto terminado."""
+
+    def __init__(self, codigo, nombre):
+        self.codigo = codigo
+        self.nombre = nombre
+
+    def calcular_costo_unitario(self):
+        raise NotImplementedError("Cada subclase debe implementar este método.")
+
+    def __str__(self):
+        return f"{self.codigo} - {self.nombre}"
+
+
+# ============================================================
+# INSUMO BÁSICO (se compra)
+# ============================================================
+class Insumo(ElementoProduccion):
+    """Elemento que se adquiere directamente. Tiene costo fijo."""
+
+    def __init__(self, codigo, nombre, costo):
+        super().__init__(codigo, nombre)
+        if costo < 0:
+            raise ValueError(f"El costo del insumo '{nombre}' no puede ser negativo.")
+        self._costo = costo
+
+    def calcular_costo_unitario(self):
+        return self._costo
+
+    def __str__(self):
+        return f"[Insumo] {self.codigo} - {self.nombre} | Costo: ${self._costo}"
+
+
+# ============================================================
+# UNIDAD DE TRABAJO
+# ============================================================
+class UnidadDeTrabajo:
+    """Representa una máquina o estación de trabajo."""
+
+    def __init__(self, codigo, nombre, costo_hora, capacidad_max_periodo, max_colaboradores):
+        self.codigo = codigo
+        self.nombre = nombre
+        self.costo_hora = costo_hora
+        self.capacidad_max_periodo = capacidad_max_periodo  # horas disponibles por período
+        self.max_colaboradores = max_colaboradores
+        self._horas_usadas = 0
+        self._colaboradores_asignados = 0
+
+    def verificar_capacidad(self, horas_requeridas, colaboradores_requeridos):
+        """Verifica si hay capacidad disponible sin modificar el estado."""
+        if self._horas_usadas + horas_requeridas > self.capacidad_max_periodo:
+            raise ValueError(
+                f"Unidad '{self.nombre}': capacidad excedida. "
+                f"Disponible: {self.capacidad_max_periodo - self._horas_usadas}h, "
+                f"Requerido: {horas_requeridas}h"
+            )
+        if self._colaboradores_asignados + colaboradores_requeridos > self.max_colaboradores:
+            raise ValueError(
+                f"Unidad '{self.nombre}': límite de colaboradores excedido. "
+                f"Disponible: {self.max_colaboradores - self._colaboradores_asignados}, "
+                f"Requerido: {colaboradores_requeridos}"
+            )
+
+    def asignar_tarea(self, horas_requeridas, colaboradores_requeridos):
+        """Asigna horas y colaboradores, validando capacidad."""
+        self.verificar_capacidad(horas_requeridas, colaboradores_requeridos)
+        self._horas_usadas += horas_requeridas
+        self._colaboradores_asignados += colaboradores_requeridos
+
+    def liberar_tarea(self, horas, colaboradores):
+        self._horas_usadas -= horas
+        self._colaboradores_asignados -= colaboradores
+
+    def horas_disponibles(self):
+        return self.capacidad_max_periodo - self._horas_usadas
+
+    def __str__(self):
+        return (f"[Unidad] {self.codigo} - {self.nombre} | "
+                f"Horas usadas: {self._horas_usadas}/{self.capacidad_max_periodo} | "
+                f"Colaboradores: {self._colaboradores_asignados}/{self.max_colaboradores}")
+
+
+# ============================================================
+# COLABORADOR
+# ============================================================
+class Colaborador:
+    """Representa un trabajador de la planta."""
+
+    def __init__(self, legajo, nombre, periodo_operacion, costo_hora):
+        self.legajo = legajo
+        self.nombre = nombre
+        self.periodo_operacion = periodo_operacion  # ej: "mañana", "tarde", "noche"
+        self.costo_hora = costo_hora
+        self._disponible = True
+
+    def esta_disponible(self, periodo):
+        return self._disponible and self.periodo_operacion == periodo
+
+    def asignar(self):
+        if not self._disponible:
+            raise ValueError(f"Colaborador '{self.nombre}' no está disponible.")
+        self._disponible = False
+
+    def liberar(self):
+        self._disponible = True
+
+    def __str__(self):
+        estado = "Disponible" if self._disponible else "Ocupado"
+        return f"[Colaborador] {self.legajo} - {self.nombre} | Turno: {self.periodo_operacion} | {estado}"
+
+
+# ============================================================
+# TAREA (paso dentro de un proceso de manufactura)
+# ============================================================
+class Tarea:
+    """Un paso específico dentro del proceso de manufactura de un artículo."""
+
+    def __init__(self, nombre, unidad_trabajo, num_colaboradores, tiempo_estandar):
+        """
+        tiempo_estandar: horas por unidad fabricada
+        num_colaboradores: cantidad de colaboradores necesarios
+        """
+        self.nombre = nombre
+        self.unidad_trabajo = unidad_trabajo  # instancia de UnidadDeTrabajo
+        self.num_colaboradores = num_colaboradores
+        self.tiempo_estandar = tiempo_estandar  # horas
+
+    def calcular_costo(self, cantidad):
+        horas_totales = self.tiempo_estandar * cantidad
+        costo_maquina = horas_totales * self.unidad_trabajo.costo_hora
+        return costo_maquina
+
+    def __str__(self):
+        return (f"  Tarea: {self.nombre} | Unidad: {self.unidad_trabajo.nombre} | "
+                f"Colaboradores: {self.num_colaboradores} | Tiempo: {self.tiempo_estandar}h/u")
+
+
+# ============================================================
+# ARTÍCULO FABRICADO INTERNAMENTE
+# ============================================================
+class ArticuloFabricado(ElementoProduccion):
+    """
+    Elemento que se fabrica internamente.
+    Tiene BOM (lista de materiales) y proceso de manufactura (lista de Tareas).
+    """
+
+    def __init__(self, codigo, nombre):
+        super().__init__(codigo, nombre)
+        self._bom = {}        # {ElementoProduccion: cantidad}
+        self._proceso = []    # [Tarea, Tarea, ...]
+
+    # ---- BOM ----
+    def agregar_componente(self, elemento, cantidad):
+        """Agrega un componente a la BOM con detección de ciclos."""
+        _validar_cantidad(cantidad)
+        if self._genera_ciclo(elemento):
+            raise ValueError(
+                f"Ciclo detectado: agregar '{elemento.nombre}' a '{self.nombre}' "
+                f"crearía una dependencia circular."
+            )
+        self._bom[elemento] = cantidad
+
+    def _genera_ciclo(self, elemento):
+        """Detecta si agregar 'elemento' generaría un ciclo en la BOM."""
+        if elemento is self:
+            return True
+        if isinstance(elemento, ArticuloFabricado):
+            for comp in elemento._bom:
+                if self._genera_ciclo(comp):
+                    return True
+        return False
+
+    def get_bom(self):
+        return dict(self._bom)
+
+    # ---- Proceso de manufactura ----
+    def agregar_tarea(self, tarea):
+        self._proceso.append(tarea)
+
+    def get_proceso(self):
+        return list(self._proceso)
+
+    # ---- Costo ----
+    def calcular_costo_unitario(self):
+        costo = 0
+        for elemento, cantidad in self._bom.items():
+            costo += elemento.calcular_costo_unitario() * cantidad
+        for tarea in self._proceso:
+            costo += tarea.calcular_costo(1)
+        return costo
+
+    def __str__(self):
+        return (f"[Fabricado] {self.codigo} - {self.nombre} | "
+                f"Costo unitario: ${self.calcular_costo_unitario():.2f}")
+
+
+# ============================================================
+# INVENTARIO
+# ============================================================
+class Inventario:
+    """Gestiona el stock de todos los elementos de producción."""
+
+    def __init__(self):
+        self._stock = {}  # {ElementoProduccion: cantidad}
+
+    def registrar_stock(self, elemento, cantidad):
+        _validar_cantidad(cantidad)
+        self._stock[elemento] = self._stock.get(elemento, 0) + cantidad
+
+    def verificar_disponibilidad(self, elemento, cantidad_requerida):
+        disponible = self._stock.get(elemento, 0)
+        if disponible < cantidad_requerida:
+            raise ValueError(
+                f"Stock insuficiente de '{elemento.nombre}': "
+                f"disponible {disponible}, requerido {cantidad_requerida}."
+            )
+
+    def consumir(self, elemento, cantidad):
+        self.verificar_disponibilidad(elemento, cantidad)
+        self._stock[elemento] -= cantidad
+
+    def reservar(self, elemento, cantidad):
+        """Reserva stock sin consumirlo (estado planificado)."""
+        self.verificar_disponibilidad(elemento, cantidad)
+
+    def stock_actual(self, elemento):
+        return self._stock.get(elemento, 0)
+
+    def mostrar(self):
+        print("\n=== INVENTARIO ===")
+        for elem, cant in self._stock.items():
+            print(f"  {elem.nombre}: {cant} unidades")
+
+    def __str__(self):
+        lineas = [f"  {e.nombre}: {c}" for e, c in self._stock.items()]
+        return "Inventario:\n" + "\n".join(lineas)
+
+
+# ============================================================
+# SOLICITUD DE FABRICACIÓN
+# ============================================================
+ESTADOS = ["creada", "planificada", "en_curso", "completada"]
+
+class SolicitudFabricacion:
+    """
+    Representa una orden de producción para un artículo fabricado.
+    Estados: creada → planificada → en_curso → completada
+    """
+
+    _contador = 1
+
+    def __init__(self, articulo, cantidad, inventario):
+        _validar_cantidad(cantidad)
+        self.id = SolicitudFabricacion._contador
+        SolicitudFabricacion._contador += 1
+        self.articulo = articulo       # ArticuloFabricado
+        self.cantidad = cantidad
+        self.inventario = inventario
+        self.estado = "creada"
+        self._necesidades = {}         # materiales necesarios tras explosión BOM
+
+    # ---- Explosión de BOM ----
+    def explotar_bom(self):
+        """Calcula todos los materiales necesarios recursivamente."""
+        self._necesidades = {}
+        self._explotar_recursivo(self.articulo, self.cantidad)
+        return dict(self._necesidades)
+
+    def _explotar_recursivo(self, articulo, cantidad):
+        if isinstance(articulo, ArticuloFabricado):
+            for componente, cant_por_unidad in articulo.get_bom().items():
+                total = cant_por_unidad * cantidad
+                self._necesidades[componente] = (
+                    self._necesidades.get(componente, 0) + total
+                )
+                self._explotar_recursivo(componente, total)
+
+    # ---- Flujo de estados ----
+    def planificar(self):
+        """Verifica recursos y pasa a estado 'planificada'."""
+        if self.estado != "creada":
+            raise ValueError(f"Solicitud #{self.id}: solo se puede planificar desde 'creada'.")
+
+        necesidades = self.explotar_bom()
+        # Verificar stock de insumos
+        for elemento, cantidad in necesidades.items():
+            if isinstance(elemento, Insumo):
+                self.inventario.verificar_disponibilidad(elemento, cantidad)
+
+        # Verificar capacidad de unidades de trabajo
+        for tarea in self.articulo.get_proceso():
+            horas_req = tarea.tiempo_estandar * self.cantidad
+            tarea.unidad_trabajo.verificar_capacidad(horas_req, tarea.num_colaboradores)
+
+        self.estado = "planificada"
+        print(f"Solicitud #{self.id} PLANIFICADA: {self.articulo.nombre} x{self.cantidad}")
+
+    def iniciar(self):
+        """Consume materiales y asigna capacidad. Pasa a 'en_curso'."""
+        if self.estado != "planificada":
+            raise ValueError(f"Solicitud #{self.id}: debe estar 'planificada' antes de iniciar.")
+
+        necesidades = self.explotar_bom()
+        # Consumir insumos del inventario
+        for elemento, cantidad in necesidades.items():
+            if isinstance(elemento, Insumo):
+                self.inventario.consumir(elemento, cantidad)
+
+        # Asignar capacidad en unidades de trabajo
+        for tarea in self.articulo.get_proceso():
+            horas_req = tarea.tiempo_estandar * self.cantidad
+            tarea.unidad_trabajo.asignar_tarea(horas_req, tarea.num_colaboradores)
+
+        self.estado = "en_curso"
+        print(f"Solicitud #{self.id} EN CURSO: {self.articulo.nombre} x{self.cantidad}")
+
+    def completar(self):
+        if self.estado != "en_curso":
+            raise ValueError(f"Solicitud #{self.id}: debe estar 'en_curso' para completar.")
+        # Liberar unidades de trabajo
+        for tarea in self.articulo.get_proceso():
+            horas_req = tarea.tiempo_estandar * self.cantidad
+            tarea.unidad_trabajo.liberar_tarea(horas_req, tarea.num_colaboradores)
+        self.estado = "completada"
+        print(f"Solicitud #{self.id} COMPLETADA: {self.articulo.nombre} x{self.cantidad}")
+
+    def mostrar_necesidades(self):
+        print(f"\n=== BOM Explosión - Solicitud #{self.id} ===")
+        print(f"Artículo: {self.articulo.nombre} | Cantidad: {self.cantidad}")
+        necesidades = self.explotar_bom()
+        for elem, cant in necesidades.items():
+            print(f"  {elem.nombre}: {cant} unidades")
+        print(f"  Costo total estimado: ${self.articulo.calcular_costo_unitario() * self.cantidad:.2f}")
+
+    def __str__(self):
+        return (f"Solicitud #{self.id} | {self.articulo.nombre} x{self.cantidad} | "
+                f"Estado: {self.estado}")
+
+
+# ============================================================
+# DETECTOR DE CUELLOS DE BOTELLA
+# ============================================================
+class DetectorCuellos:
+    """Analiza solicitudes pendientes e identifica restricciones críticas."""
+
+    def __init__(self, inventario):
+        self.inventario = inventario
+
+    def analizar(self, solicitudes):
+        print("\n=== ANÁLISIS DE CUELLOS DE BOTELLA ===")
+        cuellos = []
+
+        for sol in solicitudes:
+            if sol.estado not in ("creada", "planificada"):
+                continue
+
+            necesidades = sol.explotar_bom()
+
+            # Verificar insumos
+            for elemento, cantidad in necesidades.items():
+                if isinstance(elemento, Insumo):
+                    disponible = self.inventario.stock_actual(elemento)
+                    if disponible < cantidad:
+                        faltante = cantidad - disponible
+                        cuellos.append({
+                            "tipo": "insumo",
+                            "solicitud": sol.id,
+                            "elemento": elemento.nombre,
+                            "faltante": faltante
+                        })
+
+            # Verificar capacidad de unidades de trabajo
+            for tarea in sol.articulo.get_proceso():
+                horas_req = tarea.tiempo_estandar * sol.cantidad
+                disponible = tarea.unidad_trabajo.horas_disponibles()
+                if horas_req > disponible:
+                    cuellos.append({
+                        "tipo": "capacidad",
+                        "solicitud": sol.id,
+                        "unidad": tarea.unidad_trabajo.nombre,
+                        "horas_req": horas_req,
+                        "horas_disp": disponible
+                    })
+
+        if not cuellos:
+            print("  No se detectaron cuellos de botella.")
+        else:
+            for c in cuellos:
+                if c["tipo"] == "insumo":
+                    print(f"  ⚠ Solicitud #{c['solicitud']}: falta {c['faltante']} unidades de '{c['elemento']}'")
+                else:
+                    print(f"  ⚠ Solicitud #{c['solicitud']}: unidad '{c['unidad']}' "
+                          f"requiere {c['horas_req']}h pero solo hay {c['horas_disp']}h disponibles")
+
+        return cuellos
+
+
+# ============================================================
+# FUNCIÓN AUXILIAR DE VALIDACIÓN
+# ============================================================
+def _validar_cantidad(cantidad):
+    """Valida que una cantidad sea un entero positivo."""
+    if not isinstance(cantidad, int) or cantidad <= 0:
+        raise ValueError(f"La cantidad debe ser un número entero positivo. Se recibió: {cantidad}")
+
+
+# ============================================================
+# EJEMPLO DE USO / DEMO
+# ============================================================
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("  TecnoMecánica ITBA S.A. — Sistema MRP")
+    print("=" * 60)
+
+    # --- Insumos básicos ---
+    acero     = Insumo("INS-001", "Acero laminado (kg)",    costo=150)
+    tornillo  = Insumo("INS-002", "Tornillo M8",            costo=5)
+    goma      = Insumo("INS-003", "Junta de goma",          costo=20)
+    lubricant = Insumo("INS-004", "Lubricante (litro)",     costo=80)
+
+    # --- Unidades de trabajo ---
+    torno    = UnidadDeTrabajo("UT-01", "Torno CNC",      costo_hora=200, capacidad_max_periodo=40, max_colaboradores=3)
+    soldadura = UnidadDeTrabajo("UT-02", "Soldadura MIG", costo_hora=150, capacidad_max_periodo=30, max_colaboradores=2)
+    ensamble  = UnidadDeTrabajo("UT-03", "Mesa Ensamble", costo_hora=100, capacidad_max_periodo=50, max_colaboradores=5)
+
+    # --- Colaboradores ---
+    juan  = Colaborador("C-001", "Juan Pérez",    "mañana", costo_hora=120)
+    maria = Colaborador("C-002", "María López",   "mañana", costo_hora=130)
+    pedro = Colaborador("C-003", "Pedro Gómez",   "tarde",  costo_hora=110)
+
+    # --- Subensamble: Eje Motor ---
+    eje = ArticuloFabricado("ART-001", "Eje Motor")
+    eje.agregar_componente(acero,    cantidad=3)
+    eje.agregar_componente(tornillo, cantidad=8)
+    eje.agregar_tarea(Tarea("Torneado",  torno,    num_colaboradores=1, tiempo_estandar=2))
+    eje.agregar_tarea(Tarea("Ajuste",    ensamble, num_colaboradores=1, tiempo_estandar=0.5))
+
+    # --- Subensamble: Cuerpo Bomba ---
+    cuerpo = ArticuloFabricado("ART-002", "Cuerpo de Bomba")
+    cuerpo.agregar_componente(acero, cantidad=5)
+    cuerpo.agregar_componente(goma,  cantidad=4)
+    cuerpo.agregar_tarea(Tarea("Soldadura cuerpo", soldadura, num_colaboradores=2, tiempo_estandar=3))
+
+    # --- Producto terminado: Bomba Hidráulica ---
+    bomba = ArticuloFabricado("PROD-001", "Bomba Hidráulica")
+    bomba.agregar_componente(eje,       cantidad=1)
+    bomba.agregar_componente(cuerpo,    cantidad=1)
+    bomba.agregar_componente(lubricant, cantidad=2)
+    bomba.agregar_tarea(Tarea("Ensamble final", ensamble, num_colaboradores=2, tiempo_estandar=4))
+    bomba.agregar_tarea(Tarea("Control calidad", ensamble, num_colaboradores=1, tiempo_estandar=1))
+
+    # --- Inventario ---
+    inv = Inventario()
+    inv.registrar_stock(acero,     50)
+    inv.registrar_stock(tornillo,  100)
+    inv.registrar_stock(goma,      30)
+    inv.registrar_stock(lubricant, 20)
+    inv.mostrar()
+
+    # --- Costo unitario ---
+    print(f"\nCosto unitario Eje Motor:       ${eje.calcular_costo_unitario():.2f}")
+    print(f"Costo unitario Cuerpo Bomba:    ${cuerpo.calcular_costo_unitario():.2f}")
+    print(f"Costo unitario Bomba Hidráulica:${bomba.calcular_costo_unitario():.2f}")
+
+    # --- Solicitud de fabricación ---
+    sol1 = SolicitudFabricacion(bomba, cantidad=3, inventario=inv)
+    sol1.mostrar_necesidades()
+
+    sol1.planificar()
+    sol1.iniciar()
+    sol1.completar()
+
+    inv.mostrar()
+
+    # --- Detección de cuellos de botella ---
+    sol2 = SolicitudFabricacion(bomba, cantidad=10, inventario=inv)  # stock insuficiente
+    detector = DetectorCuellos(inv)
+    detector.analizar([sol2])
+
+    # --- Prueba de ciclo (debe lanzar error) ---
+    print("\n--- Prueba detección de ciclo ---")
+    try:
+        eje.agregar_componente(bomba, cantidad=1)  # bomba contiene eje → ciclo!
+    except ValueError as e:
+        print(f"  Error capturado correctamente: {e}")
+
+    # --- Prueba de cantidad inválida ---
+    print("\n--- Prueba cantidad inválida ---")
+    try:
+        _validar_cantidad(-5)
+    except ValueError as e:
+        print(f"  Error capturado correctamente: {e}")
+
+    print("\n¡Sistema MRP funcionando correctamente!")
